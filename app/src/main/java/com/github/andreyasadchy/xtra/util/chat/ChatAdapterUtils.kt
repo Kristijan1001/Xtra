@@ -720,6 +720,7 @@ object ChatAdapterUtils {
     }
 
     fun loadImages(fragment: Fragment, itemView: View, bind: (SpannableStringBuilder) -> Unit, images: List<Image>, imagePaint: NamePaint?, userName: String?, userNameStartIndex: Int?, backgroundColor: Int, imageLibrary: String?, builder: SpannableStringBuilder, translated: Boolean, emoteSize: Int, badgeSize: Int, gifSize: Int, emoteQuality: String, animateGifs: Boolean, enableOverlayEmotes: Boolean, chatMessage: ChatMessage, savedColors: HashMap<String, Int>, useReadableColors: Boolean, isLightTheme: Boolean, showLanguageDownloadDialog: (ChatMessage, String) -> Unit, hideErrors: Boolean) {
+        val session = ChatImageSession.begin(itemView, fragment.viewLifecycleOwner.lifecycle)
         if (imagePaint != null) {
             if (imageLibrary == "0") {
                 fragment.requireContext().imageLoader.enqueue(
@@ -730,22 +731,10 @@ object ChatAdapterUtils {
                         }.build())
                         target(
                             onSuccess = {
+                                if (!session.isCurrent) return@target
                                 (it.asDrawable(fragment.resources)).let { result ->
                                     if (result is Animatable && animateGifs) {
-                                        result.callback = object : Drawable.Callback {
-                                            override fun unscheduleDrawable(who: Drawable, what: Runnable) {
-                                                itemView.removeCallbacks(what)
-                                            }
-
-                                            override fun invalidateDrawable(who: Drawable) {
-                                                itemView.invalidate()
-                                            }
-
-                                            override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) {
-                                                itemView.postDelayed(what, `when`)
-                                            }
-                                        }
-                                        (result as Animatable).start()
+                                        session.animate(result)
                                     }
                                     try {
                                         builder.setSpan(
@@ -770,28 +759,16 @@ object ChatAdapterUtils {
                             },
                         )
                     }.build()
-                )
+                ).also { request -> session.addRequest { request.dispose() } }
             } else {
-                Glide.with(fragment)
-                    .load(GlideUrl(imagePaint.imageUrl) { mapOf("User-Agent" to "Xtra/" + BuildConfig.VERSION_NAME) })
+                val requestManager = Glide.with(fragment)
+                requestManager.load(GlideUrl(imagePaint.imageUrl) { mapOf("User-Agent" to "Xtra/" + BuildConfig.VERSION_NAME) })
                     .diskCacheStrategy(DiskCacheStrategy.DATA)
                     .into(object : CustomTarget<Drawable>() {
                         override fun onResourceReady(resource: Drawable, transition: Transition<in Drawable>?) {
+                            if (!session.isCurrent) return
                             if (resource is Animatable && animateGifs) {
-                                resource.callback = object : Drawable.Callback {
-                                    override fun unscheduleDrawable(who: Drawable, what: Runnable) {
-                                        itemView.removeCallbacks(what)
-                                    }
-
-                                    override fun invalidateDrawable(who: Drawable) {
-                                        itemView.invalidate()
-                                    }
-
-                                    override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) {
-                                        itemView.postDelayed(what, `when`)
-                                    }
-                                }
-                                (resource as Animatable).start()
+                                session.animate(resource)
                             }
                             try {
                                 builder.setSpan(
@@ -816,11 +793,11 @@ object ChatAdapterUtils {
 
                         override fun onLoadCleared(placeholder: Drawable?) {
                         }
-                    })
+                    }).also { target -> session.addRequest { requestManager.clear(target) } }
             }
         }
         images.forEach { image ->
-            loadImage(imageLibrary, fragment, image, emoteQuality) { result ->
+            loadImage(imageLibrary, fragment, image, emoteQuality, session) { result ->
                 val imageSize = when (image.size) {
                     Image.IMAGE_SIZE_EMOTE -> emoteSize
                     Image.IMAGE_SIZE_GIF -> gifSize
@@ -834,24 +811,11 @@ object ChatAdapterUtils {
                 }
                 result.setBounds(0, 0, size.first, size.second)
                 if (result is Animatable && image.isAnimated && animateGifs) {
-                    result.callback = object : Drawable.Callback {
-                        override fun unscheduleDrawable(who: Drawable, what: Runnable) {
-                            itemView.removeCallbacks(what)
-                        }
-
-                        override fun invalidateDrawable(who: Drawable) {
-                            itemView.invalidate()
-                        }
-
-                        override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) {
-                            itemView.postDelayed(what, `when`)
-                        }
-                    }
-                    (result as Animatable).start()
+                    session.animate(result)
                 }
                 if (image.overlayEmote != null) {
                     val drawables = arrayOf(result)
-                    nextOverlayEmote(imageLibrary, fragment, drawables, image.overlayEmote!!, image, itemView, bind, builder, translated, emoteSize, emoteQuality, animateGifs, enableOverlayEmotes, chatMessage, savedColors, useReadableColors, isLightTheme, showLanguageDownloadDialog, hideErrors)
+                    nextOverlayEmote(imageLibrary, fragment, session, drawables, image.overlayEmote!!, image, itemView, bind, builder, translated, emoteSize, emoteQuality, animateGifs, enableOverlayEmotes, chatMessage, savedColors, useReadableColors, isLightTheme, showLanguageDownloadDialog, hideErrors)
                 } else {
                     builder.setSpan(CenteredImageSpan(result), image.start, image.end, SPAN_EXCLUSIVE_EXCLUSIVE)
                     if (!translated && chatMessage.translatedMessage != null) {
@@ -863,8 +827,8 @@ object ChatAdapterUtils {
         }
     }
 
-    private fun nextOverlayEmote(imageLibrary: String?, fragment: Fragment, drawables: Array<Drawable>, image: Image, bottomImage: Image, itemView: View, bind: (SpannableStringBuilder) -> Unit, builder: SpannableStringBuilder, translated: Boolean, emoteSize: Int, emoteQuality: String, animateGifs: Boolean, enableOverlayEmotes: Boolean, chatMessage: ChatMessage, savedColors: HashMap<String, Int>, useReadableColors: Boolean, isLightTheme: Boolean, showLanguageDownloadDialog: (ChatMessage, String) -> Unit, hideErrors: Boolean) {
-        loadImage(imageLibrary, fragment, image, emoteQuality) { result ->
+    private fun nextOverlayEmote(imageLibrary: String?, fragment: Fragment, session: ChatImageSession, drawables: Array<Drawable>, image: Image, bottomImage: Image, itemView: View, bind: (SpannableStringBuilder) -> Unit, builder: SpannableStringBuilder, translated: Boolean, emoteSize: Int, emoteQuality: String, animateGifs: Boolean, enableOverlayEmotes: Boolean, chatMessage: ChatMessage, savedColors: HashMap<String, Int>, useReadableColors: Boolean, isLightTheme: Boolean, showLanguageDownloadDialog: (ChatMessage, String) -> Unit, hideErrors: Boolean) {
+        loadImage(imageLibrary, fragment, image, emoteQuality, session) { result ->
             val widthRatio = result.intrinsicWidth.toFloat() / result.intrinsicHeight.toFloat()
             val size = if (widthRatio == 1f) {
                 emoteSize to emoteSize
@@ -873,26 +837,14 @@ object ChatAdapterUtils {
             }
             result.setBounds(0, 0, size.first, size.second)
             if (result is Animatable && image.isAnimated && animateGifs) {
-                result.callback = object : Drawable.Callback {
-                    override fun unscheduleDrawable(who: Drawable, what: Runnable) {
-                        itemView.removeCallbacks(what)
-                    }
-
-                    override fun invalidateDrawable(who: Drawable) {
-                        itemView.invalidate()
-                    }
-
-                    override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) {
-                        itemView.postDelayed(what, `when`)
-                    }
-                }
-                (result as Animatable).start()
+                session.animate(result)
             }
             val array = drawables.plus(result)
             if (image.overlayEmote != null) {
-                nextOverlayEmote(imageLibrary, fragment, array, image.overlayEmote!!, bottomImage, itemView, bind, builder, translated, emoteSize, emoteQuality, animateGifs, enableOverlayEmotes, chatMessage, savedColors, useReadableColors, isLightTheme, showLanguageDownloadDialog, hideErrors)
+                nextOverlayEmote(imageLibrary, fragment, session, array, image.overlayEmote!!, bottomImage, itemView, bind, builder, translated, emoteSize, emoteQuality, animateGifs, enableOverlayEmotes, chatMessage, savedColors, useReadableColors, isLightTheme, showLanguageDownloadDialog, hideErrors)
             } else {
                 val layer = LayerDrawable(array)
+                if (animateGifs) session.animate(layer)
                 val width = array.maxOf { it.bounds.right }
                 val height = array.maxOf { it.bounds.bottom }
                 layer.setBounds(0, 0, width, height)
@@ -905,15 +857,15 @@ object ChatAdapterUtils {
         }
     }
 
-    private fun loadImage(imageLibrary: String?, fragment: Fragment, image: Image, emoteQuality: String, onLoaded: (Drawable) -> Unit) {
+    private fun loadImage(imageLibrary: String?, fragment: Fragment, image: Image, emoteQuality: String, session: ChatImageSession, onLoaded: (Drawable) -> Unit) {
         if (imageLibrary == "0" || (imageLibrary == "1" && !image.format.equals("webp", true))) {
-            loadCoil(fragment, image, emoteQuality, onLoaded)
+            loadCoil(fragment, image, emoteQuality, session, onLoaded)
         } else {
-            loadGlide(fragment, image, emoteQuality, onLoaded)
+            loadGlide(fragment, image, emoteQuality, session, onLoaded)
         }
     }
 
-    private fun loadCoil(fragment: Fragment, image: Image, emoteQuality: String, onLoaded: (Drawable) -> Unit) {
+    private fun loadCoil(fragment: Fragment, image: Image, emoteQuality: String, session: ChatImageSession, onLoaded: (Drawable) -> Unit) {
         fragment.requireContext().imageLoader.enqueue(
             ImageRequest.Builder(fragment.requireContext()).apply {
                 data(image.localData ?: when (emoteQuality) {
@@ -929,16 +881,16 @@ object ChatAdapterUtils {
                 }
                 target(
                     onSuccess = {
-                        onLoaded((it.asDrawable(fragment.resources)))
+                        if (session.isCurrent) onLoaded(it.asDrawable(fragment.resources))
                     },
                 )
             }.build()
-        )
+        ).also { request -> session.addRequest { request.dispose() } }
     }
 
-    private fun loadGlide(fragment: Fragment, image: Image, emoteQuality: String, onLoaded: (Drawable) -> Unit) {
-        Glide.with(fragment)
-            .load(image.localData ?: when (emoteQuality) {
+    private fun loadGlide(fragment: Fragment, image: Image, emoteQuality: String, session: ChatImageSession, onLoaded: (Drawable) -> Unit) {
+        val requestManager = Glide.with(fragment)
+        requestManager.load(image.localData ?: when (emoteQuality) {
                 "4" -> image.url4x ?: image.url3x ?: image.url2x ?: image.url1x
                 "3" -> image.url3x ?: image.url2x ?: image.url1x
                 "2" -> image.url2x ?: image.url1x
@@ -951,11 +903,11 @@ object ChatAdapterUtils {
             .diskCacheStrategy(DiskCacheStrategy.DATA)
             .into(object : CustomTarget<Drawable>() {
                 override fun onResourceReady(resource: Drawable, transition: Transition<in Drawable>?) {
-                    onLoaded(resource)
+                    if (session.isCurrent) onLoaded(resource)
                 }
 
                 override fun onLoadCleared(placeholder: Drawable?) {
                 }
-            })
+            }).also { target -> session.addRequest { requestManager.clear(target) } }
     }
 }

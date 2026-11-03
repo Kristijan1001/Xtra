@@ -21,6 +21,15 @@ class NamePaintSpan(
     private val shadows: List<NamePaint.Shadow>?,
 ) : ReplacementSpan() {
 
+    private val drawPaint = Paint()
+    private var gradient: Shader? = null
+    private var gradientX = Float.NaN
+    private var gradientWidth = Float.NaN
+    private var gradientTop = 0
+    private var gradientBottom = 0
+    private var gradientColors: IntArray? = null
+    private var gradientPositions: FloatArray? = null
+
     override fun getSize(paint: Paint, text: CharSequence?, start: Int, end: Int, fm: Paint.FontMetricsInt?): Int {
         if (fm != null) {
             val paintFm = paint.fontMetrics
@@ -34,22 +43,39 @@ class NamePaintSpan(
     }
 
     override fun draw(canvas: Canvas, text: CharSequence?, start: Int, end: Int, x: Float, top: Int, y: Int, bottom: Int, paint: Paint) {
+        // TextView may redraw this span for a neighbouring animated emote. Reuse its fixed gradient.
+        drawPaint.set(paint)
         val yOffset = y.toFloat()
         shadows?.forEach {
-            paint.setShadowLayer(it.radius, it.xOffset, it.yOffset, it.color)
-            canvas.drawText(name, x, yOffset, paint)
+            drawPaint.setShadowLayer(it.radius, it.xOffset, it.yOffset, it.color)
+            canvas.drawText(name, x, yOffset, drawPaint)
         }
-        paint.clearShadowLayer()
-        when (type) {
+        drawPaint.clearShadowLayer()
+        val width = paint.measureText(name)
+        if (width <= 0f || bottom <= top) return
+        if (gradient == null || gradientX != x || gradientWidth != width || gradientTop != top || gradientBottom != bottom ||
+            gradientColors?.contentEquals(colors) != true || gradientPositions?.contentEquals(colorPositions) != true) {
+            gradient = createGradient(x, top, bottom, width)
+            gradientX = x
+            gradientWidth = width
+            gradientTop = top
+            gradientBottom = bottom
+            gradientColors = colors.copyOf()
+            gradientPositions = colorPositions.copyOf()
+        }
+        gradient?.let { drawPaint.shader = it }
+        canvas.drawText(name, x, yOffset, drawPaint)
+    }
+
+    private fun createGradient(x: Float, top: Int, bottom: Int, width: Float): Shader? = when (type) {
             "LINEAR_GRADIENT" -> {
-                val width = paint.measureText(name)
                 val height = (bottom - top).toFloat()
                 val topFloat = top.toFloat()
                 val points = floatArrayOf(x, topFloat, x + width, topFloat)
                 val matrix = Matrix()
                 matrix.setRotate(((angle ?: 0) - 90).toFloat(), x + (width / 2), top + (height / 2))
                 matrix.mapPoints(points)
-                paint.shader = LinearGradient(
+                LinearGradient(
                     points[0],
                     min(points[1], bottom.toFloat()),
                     points[2],
@@ -64,9 +90,9 @@ class NamePaintSpan(
                 )
             }
             "RADIAL_GRADIENT" -> {
-                val halfWidth = paint.measureText(name) / 2
+                val halfWidth = width / 2
                 val height = (bottom - top).toFloat()
-                paint.shader = RadialGradient(
+                RadialGradient(
                     x + halfWidth,
                     top + (height / 2),
                     halfWidth,
@@ -79,7 +105,6 @@ class NamePaintSpan(
                     }
                 )
             }
+            else -> null
         }
-        canvas.drawText(name, x, yOffset, paint)
-    }
 }

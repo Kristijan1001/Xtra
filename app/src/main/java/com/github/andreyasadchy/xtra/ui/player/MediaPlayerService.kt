@@ -330,8 +330,7 @@ class MediaPlayerService : BasePlaybackService() {
                 playerListener?.onSeekComplete(player)
             }
             player.setOnCompletionListener { player ->
-                updatePlaybackState()
-                updateNotification()
+                updatePlayingState()
                 playerListener?.onCompletion(player)
             }
             player.setOnInfoListener { player, what, extra ->
@@ -348,6 +347,7 @@ class MediaPlayerService : BasePlaybackService() {
                 playerListener?.onError(player, width, height)
             }
             player.setOnErrorListener { player, what, extra ->
+                releaseWifiLock()
                 updatePlaybackState(true)
                 updateNotification()
                 playerListener?.onError(player, what, extra)
@@ -360,7 +360,8 @@ class MediaPlayerService : BasePlaybackService() {
                 @Suppress("DEPRECATION")
                 wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "MediaPlayer:WifiLock")
             }
-            wifiLock?.acquire()
+            // The service can remain alive for ten minutes after pause. Acquire
+            // this lock in updatePlayingState rather than for the service lifetime.
             val session = MediaSession(this, "MediaPlayerService")
             this.session = session
             session.setCallback(sessionCallback)
@@ -1431,7 +1432,7 @@ class MediaPlayerService : BasePlaybackService() {
                     if (prefs().getBoolean(C.PLAYER_DISABLE_BACKGROUND_VIDEO, true)) {
                         serviceListener?.changeSurfaceVisibility(false)
                     }
-                    if (prefs().getBoolean(C.PLAYER_USE_BACKGROUND_AUDIO_TRACK, false)) {
+                    if (prefs().getBoolean(C.PLAYER_USE_BACKGROUND_AUDIO_TRACK, true)) {
                         quality.url?.let { url ->
                             val position = player.currentPosition.toLong()
                             player.reset()
@@ -1464,7 +1465,7 @@ class MediaPlayerService : BasePlaybackService() {
                         if (prefs().getBoolean(C.PLAYER_DISABLE_BACKGROUND_VIDEO, true)) {
                             serviceListener?.changeSurfaceVisibility(false)
                         }
-                        if (prefs().getBoolean(C.PLAYER_USE_BACKGROUND_AUDIO_TRACK, false)) {
+                        if (prefs().getBoolean(C.PLAYER_USE_BACKGROUND_AUDIO_TRACK, true)) {
                             quality.url?.let { url ->
                                 val position = player.currentPosition.toLong()
                                 player.reset()
@@ -1481,6 +1482,7 @@ class MediaPlayerService : BasePlaybackService() {
                 }
             } else {
                 player.pause()
+                updatePlayingState()
             }
         }
     }
@@ -1537,87 +1539,101 @@ class MediaPlayerService : BasePlaybackService() {
     }
 
     private fun updateMetadata() {
-        val url = channelImage
-        val bitmap = if (!url.isNullOrBlank()) {
-            if (url == artworkUri && cachedBitmap != null) {
-                cachedBitmap
-            } else {
-                val networkLibrary = prefs().getString(C.NETWORK_LIBRARY, "OkHttp")
-                artworkUri = url
-                bitmapLoadJob?.cancel()
-                bitmapLoadJob = lifecycleScope.launch(Dispatchers.IO) {
-                    try {
-                        val scheme = url.toUri().scheme
-                        val response = if (scheme == "https" || scheme == "http") {
-                            when {
-                                networkLibrary == C.HTTP_ENGINE && xtraModule.httpEngine.value != null -> @SuppressLint("NewApi") {
-                                    val response = suspendCancellableCoroutine { continuation ->
-                                        val timeout = NetworkUtils.HttpEngineTimeout()
-                                        val request = xtraModule.httpEngine.value!!.newUrlRequestBuilder(
-                                            url,
-                                            xtraModule.cronetExecutor.value,
-                                            NetworkUtils.ByteArrayUrlCallback(continuation, timeout)
-                                        ).build()
-                                        timeout.start(request, continuation)
-                                        request.start()
-                                        continuation.invokeOnCancellation {
-                                            request.cancel()
-                                            timeout.stop()
-                                        }
-                                    }
-                                    if (response.info.httpStatusCode in 200..299) {
-                                        response.body
-                                    } else null
-                                }
-                                networkLibrary == C.CRONET && xtraModule.cronetEngine.value != null -> {
-                                    val response = suspendCancellableCoroutine { continuation ->
-                                        val timeout = NetworkUtils.CronetTimeout()
-                                        val request = xtraModule.cronetEngine.value!!.newUrlRequestBuilder(
-                                            url,
-                                            NetworkUtils.ByteArrayCronetCallback(continuation, timeout),
-                                            xtraModule.cronetExecutor.value
-                                        ).build()
-                                        timeout.start(request, continuation)
-                                        request.start()
-                                        continuation.invokeOnCancellation {
-                                            request.cancel()
-                                            timeout.stop()
-                                        }
-                                    }
-                                    if (response.info.httpStatusCode in 200..299) {
-                                        response.body
-                                    } else null
-                                }
-                                else -> {
-                                    xtraModule.okHttpClient.value.newCall(Request.Builder().url(url).build()).executeAsync().use { response ->
-                                        if (response.isSuccessful) {
-                                            response.body.bytes()
-                                        } else null
-                                    }
-                                }
-                            }
-                        } else {
-                            FileInputStream(url).use {
-                                it.readBytes()
-                            }
-                        }
-                        if (response != null) {
-                            val bitmap = BitmapFactory.decodeByteArray(response, 0, response.size)
-                            if (bitmap != null) {
-                                cachedBitmap = bitmap
-                                withContext(Dispatchers.Main) {
-                                    setMetadata(bitmap)
-                                }
-                            }
-                        }
-                    } catch (e: Exception) {
+        setMetadata(getArtwork())
+    }
 
+    private fun getArtwork(): Bitmap? {
+        val url = channelImage
+        if (url.isNullOrBlank()) {
+            bitmapLoadJob?.cancel()
+            bitmapLoadJob = null
+            artworkUri = null
+            cachedBitmap = null
+            return null
+        }
+        if (url == artworkUri) {
+            // Metadata and notification updates often arrive together. Share the
+            // pending request instead of canceling and downloading it again.
+            if (cachedBitmap != null || bitmapLoadJob?.isActive == true) return cachedBitmap
+        } else {
+            bitmapLoadJob?.cancel()
+            artworkUri = url
+            cachedBitmap = null
+        }
+        val networkLibrary = prefs().getString(C.NETWORK_LIBRARY, C.OKHTTP)
+        bitmapLoadJob = lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val scheme = url.toUri().scheme
+                val response = if (scheme == "https" || scheme == "http") {
+                    when {
+                        networkLibrary == C.HTTP_ENGINE && xtraModule.httpEngine.value != null -> @SuppressLint("NewApi") {
+                            val response = suspendCancellableCoroutine { continuation ->
+                                val timeout = NetworkUtils.HttpEngineTimeout()
+                                val request = xtraModule.httpEngine.value!!.newUrlRequestBuilder(
+                                    url,
+                                    xtraModule.cronetExecutor.value,
+                                    NetworkUtils.ByteArrayUrlCallback(continuation, timeout)
+                                ).build()
+                                timeout.start(request, continuation)
+                                request.start()
+                                continuation.invokeOnCancellation {
+                                    request.cancel()
+                                    timeout.stop()
+                                }
+                            }
+                            if (response.info.httpStatusCode in 200..299) {
+                                response.body
+                            } else null
+                        }
+                        networkLibrary == C.CRONET && xtraModule.cronetEngine.value != null -> {
+                            val response = suspendCancellableCoroutine { continuation ->
+                                val timeout = NetworkUtils.CronetTimeout()
+                                val request = xtraModule.cronetEngine.value!!.newUrlRequestBuilder(
+                                    url,
+                                    NetworkUtils.ByteArrayCronetCallback(continuation, timeout),
+                                    xtraModule.cronetExecutor.value
+                                ).build()
+                                timeout.start(request, continuation)
+                                request.start()
+                                continuation.invokeOnCancellation {
+                                    request.cancel()
+                                    timeout.stop()
+                                }
+                            }
+                            if (response.info.httpStatusCode in 200..299) {
+                                response.body
+                            } else null
+                        }
+                        else -> {
+                            xtraModule.okHttpClient.value.newCall(Request.Builder().url(url).build()).executeAsync().use { response ->
+                                if (response.isSuccessful) {
+                                    response.body.bytes()
+                                } else null
+                            }
+                        }
+                    }
+                } else {
+                    FileInputStream(url).use {
+                        it.readBytes()
                     }
                 }
-                null
+                if (response != null) {
+                    val bitmap = BitmapFactory.decodeByteArray(response, 0, response.size)
+                    if (bitmap != null) {
+                        withContext(Dispatchers.Main) {
+                            if (created && artworkUri == url) {
+                                cachedBitmap = bitmap
+                                setMetadata(bitmap)
+                                sendNotification(bitmap)
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+
             }
-        } else null
-        setMetadata(bitmap)
+        }
+        return null
     }
 
     private fun setMetadata(bitmap: Bitmap?) {
@@ -1637,87 +1653,7 @@ class MediaPlayerService : BasePlaybackService() {
     }
 
     private fun updateNotification() {
-        val url = channelImage
-        val bitmap = if (!url.isNullOrBlank()) {
-            if (url == artworkUri && cachedBitmap != null) {
-                cachedBitmap
-            } else {
-                val networkLibrary = prefs().getString(C.NETWORK_LIBRARY, "OkHttp")
-                artworkUri = url
-                bitmapLoadJob?.cancel()
-                bitmapLoadJob = lifecycleScope.launch(Dispatchers.IO) {
-                    try {
-                        val scheme = url.toUri().scheme
-                        val response = if (scheme == "https" || scheme == "http") {
-                            when {
-                                networkLibrary == C.HTTP_ENGINE && xtraModule.httpEngine.value != null -> @SuppressLint("NewApi") {
-                                    val response = suspendCancellableCoroutine { continuation ->
-                                        val timeout = NetworkUtils.HttpEngineTimeout()
-                                        val request = xtraModule.httpEngine.value!!.newUrlRequestBuilder(
-                                            url,
-                                            xtraModule.cronetExecutor.value,
-                                            NetworkUtils.ByteArrayUrlCallback(continuation, timeout)
-                                        ).build()
-                                        timeout.start(request, continuation)
-                                        request.start()
-                                        continuation.invokeOnCancellation {
-                                            request.cancel()
-                                            timeout.stop()
-                                        }
-                                    }
-                                    if (response.info.httpStatusCode in 200..299) {
-                                        response.body
-                                    } else null
-                                }
-                                networkLibrary == C.CRONET && xtraModule.cronetEngine.value != null -> {
-                                    val response = suspendCancellableCoroutine { continuation ->
-                                        val timeout = NetworkUtils.CronetTimeout()
-                                        val request = xtraModule.cronetEngine.value!!.newUrlRequestBuilder(
-                                            url,
-                                            NetworkUtils.ByteArrayCronetCallback(continuation, timeout),
-                                            xtraModule.cronetExecutor.value
-                                        ).build()
-                                        timeout.start(request, continuation)
-                                        request.start()
-                                        continuation.invokeOnCancellation {
-                                            request.cancel()
-                                            timeout.stop()
-                                        }
-                                    }
-                                    if (response.info.httpStatusCode in 200..299) {
-                                        response.body
-                                    } else null
-                                }
-                                else -> {
-                                    xtraModule.okHttpClient.value.newCall(Request.Builder().url(url).build()).executeAsync().use { response ->
-                                        if (response.isSuccessful) {
-                                            response.body.bytes()
-                                        } else null
-                                    }
-                                }
-                            }
-                        } else {
-                            FileInputStream(url).use {
-                                it.readBytes()
-                            }
-                        }
-                        if (response != null) {
-                            val bitmap = BitmapFactory.decodeByteArray(response, 0, response.size)
-                            if (bitmap != null) {
-                                cachedBitmap = bitmap
-                                withContext(Dispatchers.Main) {
-                                    sendNotification(bitmap)
-                                }
-                            }
-                        }
-                    } catch (e: Exception) {
-
-                    }
-                }
-                null
-            }
-        } else null
-        sendNotification(bitmap)
+        sendNotification(getArtwork())
     }
 
     private fun sendNotification(bitmap: Bitmap?) {
@@ -1934,10 +1870,12 @@ class MediaPlayerService : BasePlaybackService() {
     }
 
     fun updatePlayingState() {
+        if (!created) return
         updatePlaybackState()
         updateNotification()
         player?.let { player ->
             if (player.isPlaying) {
+                if (wifiLock?.isHeld == false) wifiLock?.acquire()
                 if (savePositionTimer == null && type != STREAM) {
                     savePositionTimer = Timer().apply {
                         scheduleAtFixedRate(30000, 30000) {
@@ -1950,6 +1888,7 @@ class MediaPlayerService : BasePlaybackService() {
                 stopServiceTimer?.cancel()
                 stopServiceTimer = null
             } else {
+                releaseWifiLock()
                 savePositionTimer?.cancel()
                 savePositionTimer = null
                 updateSavedPosition()
@@ -2059,12 +1998,26 @@ class MediaPlayerService : BasePlaybackService() {
     }
 
     override fun onDestroy() {
+        created = false
+        sleepTimer?.cancel()
+        sleepTimer = null
+        savePositionTimer?.cancel()
+        savePositionTimer = null
+        stopServiceTimer?.cancel()
+        stopServiceTimer = null
+        releaseWifiLock()
+        dynamicsProcessing?.release()
+        dynamicsProcessing = null
         super.onDestroy()
-        wifiLock?.release()
         player?.release()
+        player = null
         session?.release()
         bitmapLoadJob?.cancel()
         notificationManager?.cancel(NOTIFICATION_ID)
+    }
+
+    private fun releaseWifiLock() {
+        if (wifiLock?.isHeld == true) wifiLock?.release()
     }
 
     companion object {

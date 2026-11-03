@@ -24,11 +24,11 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.github.andreyasadchy.xtra"
+        applicationId = "com.github.kristijan1001.xtra"
         minSdk = 24
         targetSdk = 37
-        versionCode = 121
-        versionName = "2.60.10"
+        versionCode = 122
+        versionName = "2.60.10-plus.1"
     }
 
     buildTypes {
@@ -65,6 +65,7 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     compileOnly("com.google.j2objc:j2objc-annotations:3.0.0") // OkHttpDataSource SettableFuture
     implementation("com.google.mlkit:language-id:17.0.6")
     implementation("com.google.mlkit:translate:17.0.3")

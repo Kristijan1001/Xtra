@@ -9,11 +9,10 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.BufferedReader
+import java.io.BufferedInputStream
 import java.io.BufferedWriter
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import java.io.InputStreamReader
 import java.io.OutputStream
 import java.io.OutputStreamWriter
 import java.net.Socket
@@ -99,9 +98,10 @@ class WebSocket(
             SSLContext.getDefault().socketFactory
         }
         socket = socketFactory.createSocket(host, 443)
-        inputStream = socket?.inputStream
+        // Keep the handshake and frames on one buffer. A separate BufferedReader
+        // can consume the first frame while reading ahead past the HTTP headers.
+        inputStream = BufferedInputStream(socket!!.inputStream)
         outputStream = socket?.outputStream
-        val reader = BufferedReader(InputStreamReader(inputStream))
         val writer = BufferedWriter(OutputStreamWriter(outputStream))
         val key = Base64.encodeToString(Random.nextBytes(16), Base64.NO_WRAP)
         writer.write("GET /$path HTTP/1.1\r\n")
@@ -119,7 +119,7 @@ class WebSocket(
         useCompression = false
         messageByteArray = null
         var validated = false
-        var line = reader.readLine()
+        var line = WebSocketInput.readHeaderLine(inputStream!!)
         if (!line.startsWith("HTTP/1.1 101", true)) {
             listener.onDisconnect(this@WebSocket, line)
             if (line.startsWith("HTTP/1.1 429", true)) {
@@ -129,7 +129,7 @@ class WebSocket(
                 return@withContext true
             }
         }
-        line = reader.readLine()
+        line = WebSocketInput.readHeaderLine(inputStream!!)
         while (!line.isNullOrBlank()) {
             when {
                 line.startsWith("Sec-WebSocket-Accept", true) -> {
@@ -146,7 +146,7 @@ class WebSocket(
                     } != null
                 }
             }
-            line = reader.readLine()
+            line = WebSocketInput.readHeaderLine(inputStream!!)
         }
         if (!validated) {
             listener.onDisconnect(this@WebSocket, "")
@@ -200,62 +200,16 @@ class WebSocket(
         val lengthBytes = secondByte and LENGTH
         val length = when (lengthBytes) {
             LENGTH_SHORT -> {
-                val size = 2
-                val array = ByteArray(size)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    inputStream?.readNBytes(array, 0, size)
-                } else {
-                    inputStream?.let {
-                        var offset = 0
-                        while (offset < size) {
-                            val count = it.read(array, 0 + offset, size - offset)
-                            if (count < 0) {
-                                break
-                            }
-                            offset += count
-                        }
-                    }
-                }
+                val array = WebSocketInput.readFully(inputStream!!, 2)
                 ByteBuffer.wrap(array).short.toInt() and 0xffff
             }
             LENGTH_LONG -> {
-                val size = 8
-                val array = ByteArray(size)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    inputStream?.readNBytes(array, 0, size)
-                } else {
-                    inputStream?.let {
-                        var offset = 0
-                        while (offset < size) {
-                            val count = it.read(array, 0 + offset, size - offset)
-                            if (count < 0) {
-                                break
-                            }
-                            offset += count
-                        }
-                    }
-                }
+                val array = WebSocketInput.readFully(inputStream!!, 8)
                 ByteBuffer.wrap(array).long.toInt()
             }
             else -> lengthBytes
         }
-        val data = ByteArray(length)
-        if (length > 0) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                inputStream?.readNBytes(data, 0, length)
-            } else {
-                inputStream?.let {
-                    var offset = 0
-                    while (offset < length) {
-                        val count = it.read(data, 0 + offset, length - offset)
-                        if (count < 0) {
-                            break
-                        }
-                        offset += count
-                    }
-                }
-            }
-        }
+        val data = WebSocketInput.readFully(inputStream!!, length)
         if (isControlFrame) {
             when (opcode) {
                 OPCODE_PING -> {
@@ -280,10 +234,15 @@ class WebSocket(
                     val messageData = if ((opcode == OPCODE_CONTINUATION && nextFrameCompressed) || compressed) {
                         val decompressedStream = ByteArrayOutputStream()
                         val inflater = Inflater(true)
-                        val inflaterStream = InflaterOutputStream(decompressedStream, inflater)
-                        inflaterStream.write(data)
-                        inflaterStream.write(0x0000ffff)
-                        inflaterStream.close()
+                        try {
+                            InflaterOutputStream(decompressedStream, inflater).use { inflaterStream ->
+                                inflaterStream.write(data)
+                                inflaterStream.write(byteArrayOf(0, 0, -1, -1))
+                            }
+                        } finally {
+                            // Streams do not own an explicitly supplied native inflater.
+                            inflater.end()
+                        }
                         decompressedStream.toByteArray()
                     } else {
                         data
@@ -338,9 +297,11 @@ class WebSocket(
             firstByte = firstByte or COMPRESSED_BIT
             val compressedStream = ByteArrayOutputStream()
             val deflater = Deflater(Deflater.DEFAULT_COMPRESSION, true)
-            val deflaterStream = DeflaterOutputStream(compressedStream, deflater)
-            deflaterStream.write(messageBytes)
-            deflaterStream.close()
+            try {
+                DeflaterOutputStream(compressedStream, deflater).use { it.write(messageBytes) }
+            } finally {
+                deflater.end()
+            }
             val compressedBytes = compressedStream.toByteArray()
             if (compressedBytes.takeLast(5) == EMPTY_DEFLATE_BLOCK) {
                 compressedBytes.dropLast(4).toByteArray()
